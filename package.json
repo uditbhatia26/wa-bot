@@ -8,8 +8,11 @@
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
+    "@langchain/core": "0.3.78",
+    "@langchain/groq": "0.2.4",
     "@whiskeysockets/baileys": "^6.7.20",
     "express": "^5.1.0",
+    "langchain": "0.3.34",
     "qrcode-terminal": "^0.12.0"
   }
 }
