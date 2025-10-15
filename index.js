@@ -9,9 +9,40 @@ import path from "path";
 import { fileURLToPath } from "url";
 import qrcode from "qrcode-terminal";
 import express from "express";
+import { fetchLatestBaileysVersion } from "@whiskeysockets/baileys";
+
+// LangChain + Groq
+import { ChatGroq } from "@langchain/groq";
+import { PromptTemplate } from "@langchain/core/prompts";
+import { RunnableSequence } from "@langchain/core/runnables";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+
+// Groq LLM via LangChain
+const lcModel = new ChatGroq({
+  model: "llama-3.3-70b-versatile",
+  temperature: 0.3,
+  apiKey: process.env.GROQ_API_KEY,
+});
+
+// Summarization chain
+const summarizePrompt = PromptTemplate.fromTemplate(
+  `You are a concise WhatsApp chat summarizer.
+Summarize the following {k} most recent messages.
+- Be brief, structured, and neutral.
+- Use bullet points.
+- Add short action items if obvious.
+Messages:
+{messages}`
+);
+
+const summarizeChain = RunnableSequence.from([
+  summarizePrompt,
+  lcModel,
+  new StringOutputParser(),
+]);
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,7 +56,7 @@ let restarting = false;
 
 /* ----------------- 🔐 OWNER CONFIG ----------------- */
 const OWNER_JIDS = [
-  "918929676776@s.whatsapp.net", // 🟢 Your WhatsApp number
+  "919717228929@s.whatsapp.net",
 ];
 
 /* ----------------- 🔧 FILE HELPERS ----------------- */
@@ -56,6 +87,25 @@ function chunkArray(arr, size) {
   return out;
 }
 
+/* ----------------- 💾 ROLLING CHAT BUFFER ----------------- */
+const MAX_BUFFER_PER_CHAT = 200;
+const chatBuffers = new Map(); // remoteJid -> [{ from, text, ts }]
+
+function addToChatBuffer(remoteJid, entry) {
+  if (!entry?.text) return;
+  const arr = chatBuffers.get(remoteJid) || [];
+  arr.push(entry);
+  if (arr.length > MAX_BUFFER_PER_CHAT) {
+    arr.splice(0, arr.length - MAX_BUFFER_PER_CHAT);
+  }
+  chatBuffers.set(remoteJid, arr);
+}
+
+function getRecentMessages(remoteJid, k) {
+  const arr = chatBuffers.get(remoteJid) || [];
+  return arr.slice(-k);
+}
+
 /* ----------------- 🧠 MESSAGE HELPERS ----------------- */
 function extractNumbersFromText(text) {
   const nums = Array.from(new Set(text.match(/\b\d{8,15}\b/g) || []));
@@ -75,7 +125,7 @@ async function extractMentionedJids(msg, sock, meta) {
     contextInfo = inner?.contextInfo || {};
   }
 
-  const groupIds = new Set((meta?.participants || []).map((p) => p.id));
+  const groupIds = new Set((meta?.participants || []).map((p) => p.id || p.jid));
   let jids = Array.isArray(contextInfo?.mentionedJid)
     ? [...contextInfo.mentionedJid]
     : [];
@@ -84,9 +134,10 @@ async function extractMentionedJids(msg, sock, meta) {
   for (const id of jids) {
     if (id.endsWith("@lid")) {
       const num = id.replace("@lid", "");
-      // Try to resolve via group members
-      const match = (meta.participants || []).find((p) => p.id.includes(num));
-      if (match?.id) resolved.push(match.id);
+      const match = (meta.participants || []).find(
+        (p) => (p.id || p.jid)?.includes(num)
+      );
+      if (match?.id || match?.jid) resolved.push(match.id || match.jid);
       else console.log("⚠️ Could not resolve LID:", id);
     } else resolved.push(id);
   }
@@ -128,6 +179,20 @@ function getQuotedMessage(msg) {
   };
 }
 
+/* ----------------- 🛡️ PERMISSIONS ----------------- */
+async function isAdmin(sock, remoteJid, sender) {
+  try {
+    const meta = await sock.groupMetadata(remoteJid);
+    const p = (meta.participants || []).find(
+      (x) => (x.id || x.jid) === sender
+    );
+    return p?.admin === "admin" || p?.admin === "superadmin";
+  } catch (e) {
+    console.warn("isAdmin() failed to fetch group metadata:", e?.message);
+    return false;
+  }
+}
+
 /* ----------------- 🧩 BOT START ----------------- */
 async function startBot(backoffMs = 1000) {
   try {
@@ -135,7 +200,14 @@ async function startBot(backoffMs = 1000) {
     if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(authPath);
-    const sock = makeWASocket({ auth: state });
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: true,
+      browser: ["Ubuntu", "Chrome", "22.04.4"],
+    });
 
     sock.ev.on("creds.update", saveCreds);
 
@@ -191,6 +263,16 @@ async function startBot(backoffMs = 1000) {
           msg.message?.videoMessage?.caption ||
           "";
         const trimmed = text.trim();
+
+        // ✅ buffer messages so summarize works
+        if (trimmed) {
+          addToChatBuffer(remoteJid, {
+            from: sender,
+            text: trimmed,
+            ts: Date.now(),
+          });
+        }
+
         if (!trimmed.startsWith(PREFIX)) return;
 
         const withoutPrefix = trimmed.slice(PREFIX.length).trim();
@@ -201,26 +283,33 @@ async function startBot(backoffMs = 1000) {
         const groupKey = isGroup ? remoteJid : "global";
         if (!db[groupKey]) db[groupKey] = {};
 
-        /* 🧩 DM PERMISSION CHECK */
+        /* 🧩 DM PERMISSION CHECK (keep owner-only in DMs) */
         if (!isGroup && !OWNER_JIDS.includes(sender)) {
           console.log(`❌ Ignored DM from unauthorized user: ${sender}`);
           return;
         }
 
-        /* ----------------- !tagall ----------------- */
+        /* ----------------- !tagall (Admins or Owners only) ----------------- */
         if (cmd === CMD_TAGALL && isGroup) {
+          const isOwner = OWNER_JIDS.includes(sender);
+          const isGrpAdmin = await isAdmin(sock, remoteJid, sender);
+          if (!isOwner && !isGrpAdmin) {
+            await sock.sendMessage(remoteJid, {
+              text: "🚫 Only group admins can use !tagall.",
+            });
+            return;
+          }
+
           const meta = await sock.groupMetadata(remoteJid);
           const selfDigits = getSelfJid(sock);
           const members = meta.participants
-            .map((p) => p.jid || p.id) // ✅ Prefer the real JID if available
+            .map((p) => p.jid || p.id)
             .filter(Boolean)
             .filter((jid) => normalizeJid(jid) !== selfDigits);
 
           const chunks = chunkArray(members, 20);
           for (const chunk of chunks) {
-            const tagMessage = chunk
-              .map((m) => `@${m.split("@")[0]}`)
-              .join(" ");
+            const tagMessage = chunk.map((m) => `@${m.split("@")[0]}`).join(" ");
             const quoted = getQuotedMessage(msg);
             await sock.sendMessage(
               remoteJid,
@@ -232,183 +321,253 @@ async function startBot(backoffMs = 1000) {
           return;
         }
 
-        /* ----------------- !group ----------------- */
+        /* ----------------- !group (updated permissions & behavior) ----------------- */
         if (cmd === "group") {
           const subcmd = (args.shift() || "").toLowerCase();
 
-          // Help for group command
           if (!subcmd) {
             await sock.sendMessage(remoteJid, {
               text: `🧩 *Subgroup Commands*
-• !group add <name> <numbers or @mentions>
-• !group remove <name> <numbers or @mentions>
-• !group show <name>
-• !group list
-• !group delete <name>`,
+• !group create <name> — create a new subgroup (admin/owner)
+• !group add <name> <@mentions or numbers> — add members (anyone in group)
+• !group remove <name> <@mentions or numbers> — remove members (admin/owner)
+• !group tag <name> <@mentions or numbers> — tag members (admin/owner)
+• !group list — list subgroups (anyone)
+• !group delete <name> — delete subgroup (admin/owner)`,
             });
             return;
           }
 
-          // Manage permissions: only owners can edit
-          if (!OWNER_JIDS.includes(sender)) {
-            await sock.sendMessage(remoteJid, {
-              text: "🚫 You don’t have permission to manage subgroups.",
-            });
-            return;
-          }
+          const isOwner = OWNER_JIDS.includes(sender);
+          const isGrpAdmin = isGroup ? await isAdmin(sock, remoteJid, sender) : false;
 
-          /* !group list */
+          // Permissions per subcommand
+          if (subcmd === "create" || subcmd === "delete" || subcmd === "remove") {
+            if (!isGrpAdmin) {
+              await sock.sendMessage(remoteJid, {
+                text: "🚫 Only group admins can perform this action.",
+              });
+              return;
+            }
+          }
+          // "add" is open to everyone in the group (DM still restricted above)
+          // "list" and "show" are open to everyone
+
+          /* !group list (anyone) */
           if (subcmd === "list") {
             const names = Object.keys(db[groupKey]);
             const lines = names.length
-              ? names
-                  .map((n) => `• *${n}* (${db[groupKey][n].length})`)
-                  .join("\n")
+              ? names.map((n) => `• *${n}* (${db[groupKey][n].length})`).join("\n")
               : "_No subgroups yet._";
             await sock.sendMessage(remoteJid, {
-              text: `🧩 *${
-                groupKey === "global" ? "Global" : "Group"
-              } Subgroups*\n${lines}`,
+              text: `🧩 *${groupKey === "global" ? "Global" : "Group"} Subgroups*\n${lines}`,
             });
             return;
           }
 
-          /* !group show <name> */
+          /* !group tag <name> (anyone) */
+          if (subcmd === "tag") {
+            if (!isGrpAdmin) {
+
+            }
+            else {
+              const name = (args.shift() || "").toLowerCase();
+              const list = db[groupKey][name] || [];
+              if (!name) {
+                await sock.sendMessage(remoteJid, { text: "Usage: !group tag <name>" });
+                return;
+              }
+              if (!list.length) {
+                await sock.sendMessage(remoteJid, { text: `No members in *${name}*.` });
+                return;
+              }
+              const txt = list.map((j) => `@${j.split("@")[0]}`).join(" ");
+              await sock.sendMessage(remoteJid, {
+                text: `Tagging *${name}* (${list.length})\n${txt}`,
+                mentions: list,
+              });
+              return;
+            }
+
+          }
+
+
+          /* !group show <name> (anyone) */
           if (subcmd === "show") {
             const name = (args.shift() || "").toLowerCase();
             const list = db[groupKey][name] || [];
+            if (!name) {
+              await sock.sendMessage(remoteJid, { text: "Usage: !group show <name>" });
+              return;
+            }
             if (!list.length) {
-              await sock.sendMessage(remoteJid, {
-                text: `No members in *${name}*.`,
-              });
+              await sock.sendMessage(remoteJid, { text: `No members in *${name}*.` });
               return;
             }
             const txt = list.map((j) => `@${j.split("@")[0]}`).join(" ");
             await sock.sendMessage(remoteJid, {
-              text: `👥 *${name}* (${list.length})\n${txt}`,
+              text: `👥 Members in *${name}* (${list.length})\n${txt}`,
               mentions: list,
             });
             return;
           }
 
-          /* !group delete <name> */
+          /* !group create <name> (admin/owner) */
+          if (subcmd === "create") {
+            const name = (args.shift() || "").toLowerCase();
+            if (!name) {
+              await sock.sendMessage(remoteJid, { text: "Usage: !group create <name>" });
+              return;
+            }
+            if (db[groupKey][name]) {
+              await sock.sendMessage(remoteJid, { text: `⚠️ Subgroup *${name}* already exists.` });
+              return;
+            }
+            db[groupKey][name] = [];
+            saveDb(db);
+            await sock.sendMessage(remoteJid, { text: `✅ Created subgroup *${name}*.` });
+            return;
+          }
+
+          /* !group delete <name> (admin/owner) */
           if (subcmd === "delete") {
             const name = (args.shift() || "").toLowerCase();
+            if (!db[groupKey][name]) {
+              await sock.sendMessage(remoteJid, { text: `No such subgroup *${name}*.` });
+              return;
+            }
             delete db[groupKey][name];
             saveDb(db);
-            await sock.sendMessage(remoteJid, {
-              text: `🗑️ Deleted subgroup *${name}*.`,
-            });
+            await sock.sendMessage(remoteJid, { text: `🗑️ Deleted subgroup *${name}*.` });
             return;
           }
 
           /* !group add/remove */
           if (["add", "remove"].includes(subcmd)) {
             const name = (args.shift() || "").toLowerCase();
+            if (!name) {
+              await sock.sendMessage(remoteJid, { text: `Usage: !group ${subcmd} <name> <@mentions or numbers>` });
+              return;
+            }
+
+            // For "add": subgroup MUST already exist (no implicit create)
+            if (subcmd === "add" && !db[groupKey][name]) {
+              await sock.sendMessage(remoteJid, {
+                text: `⚠️ Subgroup *${name}* does not exist. Ask an admin to run *!group create ${name}* first.`,
+              });
+              return;
+            }
+
+            // For "remove": also require subgroup exists
+            if (subcmd === "remove" && !db[groupKey][name]) {
+              await sock.sendMessage(remoteJid, { text: `No such subgroup *${name}*.` });
+              return;
+            }
+
             let mentions = [];
             if (isGroup) {
               const meta = await sock.groupMetadata(remoteJid);
               mentions = await extractMentionedJids(msg, sock, meta);
+
+              // ✅ Self-add: if user didn't mention anyone and this is an ADD in a group, add the sender
+              if (subcmd === "add" && mentions.length === 0) {
+                mentions = [sender];
+              }
             } else {
+              // In DMs (already owner-only), allow numbers
               mentions = extractNumbersFromText(text);
             }
 
             if (!mentions.length) {
               await sock.sendMessage(remoteJid, {
-                text: "No valid members found. Mention in group or use numbers in DM.",
+                text: "No valid members found. In a group, use @mentions or just run “!group add <name>” to add yourself. In DM, provide numbers.",
               });
               return;
             }
 
-            if (!db[groupKey][name]) db[groupKey][name] = [];
-            const set = new Set(db[groupKey][name]);
+
+            const set = new Set(db[groupKey][name] || []);
             if (subcmd === "add") mentions.forEach((j) => set.add(j));
             else mentions.forEach((j) => set.delete(j));
 
             db[groupKey][name] = Array.from(set);
             saveDb(db);
+
             await sock.sendMessage(remoteJid, {
-              text: `✅ Updated *${name}* (${db[groupKey][name].length} members).`,
+              text: `✅ ${subcmd === "add" ? "Added to" : "Updated"} *${name}* (${db[groupKey][name].length} members).`,
             });
             return;
           }
+
+          // Unknown subcommand
+          await sock.sendMessage(remoteJid, { text: "Unknown subcommand. Type !group for help." });
+          return;
         }
 
-        /* ----------------- !tag<name> (only tag members present in THIS group) ----------------- */
-        if (cmd.startsWith("tag") && cmd !== CMD_TAGALL) {
-          const name = cmd.slice(3).toLowerCase();
-
-          // 1) Fetch saved subgroup list (group-local first, then global fallback)
-          const rawList = db[remoteJid]?.[name] || db.global?.[name] || [];
-          if (!rawList.length) {
-            await sock.sendMessage(remoteJid, {
-              text: `No members in subgroup *${name}*.`,
-            });
-            return;
-          }
-
-          // 2) Build a map of current group's participants -> normalized digits
-          const meta = await sock.groupMetadata(remoteJid);
-          const selfDigits = getSelfJid(sock);
-
-          const presentMap = new Map(); // digits -> actual JID in this group
-          for (const p of meta.participants || []) {
-            const jid = p?.jid || p?.id;
-            const d = normalizeJid(jid);
-            if (d && d !== selfDigits) presentMap.set(d, jid);
-          }
-
-          // 3) Intersect subgroup members with present participants
-          const finalMentions = [];
-          for (const j of rawList) {
-            const d = normalizeJid(j);
-            const mapped = d && presentMap.get(d);
-            if (mapped) finalMentions.push(mapped);
-          }
-
-          // 4) Dedupe and send
-          const mentions = Array.from(new Set(finalMentions));
-          if (!mentions.length) {
-            await sock.sendMessage(remoteJid, {
-              text: `No members of subgroup *${name}* are present in this group.`,
-            });
-            return;
-          }
-
-          const chunks = chunkArray(mentions, 20);
-          for (const chunk of chunks) {
-            const msgText = chunk.map((m) => `@${m.split("@")[0]}`).join(" ");
-            const quoted = getQuotedMessage(msg);
-            await sock.sendMessage(
-              remoteJid,
-              { text: msgText, mentions: chunk },
-              quoted ? { quoted } : {}
-            );
-            await new Promise((r) => setTimeout(r, 400));
+        /* ----------------- fun sticker ----------------- */
+        if (trimmed.toLowerCase() === "!naman summon") {
+          try {
+            const stickerPath = path.join(__dirname, "stickers", "naman.webp");
+            if (!fs.existsSync(stickerPath)) {
+              await sock.sendMessage(remoteJid, {
+                text: "⚠️ Sticker not found! Please add `naman.webp` in /stickers folder.",
+              });
+              return;
+            }
+            const stickerBuffer = fs.readFileSync(stickerPath);
+            await sock.sendMessage(remoteJid, { sticker: stickerBuffer });
+          } catch (err) {
+            console.error("💥 Error sending sticker:", err);
           }
           return;
         }
 
-        /* ----------------- !arnav bhai ----------------- */
-        if (trimmed.toLowerCase() === "!arnav bhai") {
-          try {
-            // Path to your sticker (must be in .webp format)
-            const stickerPath = path.join(__dirname, "stickers", "arnav.webp");
-
-            if (!fs.existsSync(stickerPath)) {
-              await sock.sendMessage(remoteJid, {
-                text: "⚠️ Sticker not found! Please add `arnav.webp` in /stickers folder.",
-              });
-              return;
-            }
-
-            const stickerBuffer = fs.readFileSync(stickerPath);
-
+        /* ----------------- !summarize <k> (Everyone in group) ----------------- */
+        if (cmd === "summarize") {
+          if (!isGroup) {
             await sock.sendMessage(remoteJid, {
-              sticker: stickerBuffer,
+              text: "This command works in groups only.",
             });
-          } catch (err) {
-            console.error("💥 Error sending sticker:", err);
+            return;
+          }
+
+          let kRaw = args.shift();
+          let k = parseInt(kRaw ?? "20", 10);
+          if (!Number.isFinite(k) || k <= 0) k = 20;
+          if (k > 100) k = 100;
+
+          const recent = getRecentMessages(remoteJid, k);
+          if (!recent.length) {
+            await sock.sendMessage(remoteJid, {
+              text: "No cached messages to summarize yet.",
+            });
+            return;
+          }
+
+          const formatted = recent
+            .map((m) => `- ${m.from.replace("@s.whatsapp.net", "")}: ${m.text}`)
+            .join("\n");
+
+          if (!process.env.GROQ_API_KEY) {
+            await sock.sendMessage(remoteJid, {
+              text: "⚠️ Summarizer not configured. Set GROQ_API_KEY in environment.",
+            });
+            return;
+          }
+
+          try {
+            const summary = await summarizeChain.invoke({
+              k: recent.length,
+              messages: formatted,
+            });
+            await sock.sendMessage(remoteJid, {
+              text: `📝 *Summary of last ${recent.length} messages:*\n${summary}`,
+            });
+          } catch (e) {
+            console.error("Summarize error:", e);
+            await sock.sendMessage(remoteJid, {
+              text: "❌ Failed to summarize messages.",
+            });
           }
           return;
         }
@@ -417,9 +576,15 @@ async function startBot(backoffMs = 1000) {
         if (cmd === "help") {
           await sock.sendMessage(remoteJid, {
             text: `🛠️ *Available Commands*
-• !tagall — tag everyone (group)
-• !tag<name> — tag subgroup
-• !group add/remove/show/list/delete — manage subgroups (only owner in DM)`,
+• !group create <name> — create subgroup (admin/owner)
+• !group add <name> <members> — add to subgroup (anyone in group)
+• !group remove <name> <members> — remove from subgroup (admin/owner)
+• !group show <name> — view subgroup members (anyone)
+• !group list — list subgroups (anyone)
+• !group delete <name> — delete subgroup (admin/owner)
+• !group tag <name> — tag subgroup (admins/owners only)
+• !tagall — tag everyone (admin/owner)
+• !summarize <k> — summarize last k (≤100) messages (anyone in group)`,
           });
         }
       } catch (err) {
